@@ -820,19 +820,26 @@ def ide_patch(path):
 AUTOUPDATE_ENV = "AGY_CLI_DISABLE_AUTO_UPDATE"
 AUTOUPDATE_MARK = "# agy-manager: antigravity cli background auto-update"
 
-def _autoupdate_rc_candidates():
-    """Return (existing-first rc candidates, fish syntax) for the login shell."""
+def _autoupdate_rc_files():
+    """Startup files to carry the variable, covering login and non-login shells.
+
+    A bash login shell reads the first existing .bash_profile/.bash_login/
+    .profile while an interactive non-login shell reads .bashrc even when the
+    login profile does not source it, so the variable goes to .bashrc as well
+    as the login profile (Bash Startup Files). An interactive fish shell reads
+    config.fish and zsh reads .zshrc.
+    """
     home = os.path.expanduser("~")
     shell = os.path.basename(os.environ.get("SHELL") or "")
     if shell == "fish":
-        return [os.path.join(home, ".config", "fish", "config.fish")], True
+        return [os.path.join(home, ".config", "fish", "config.fish")]
     if shell == "zsh":
-        names = (".zshrc", ".zprofile", ".profile")
-    elif shell == "bash":
-        names = (".bashrc", ".bash_profile", ".profile")
-    else:
-        names = (".profile",)
-    return [os.path.join(home, n) for n in names], False
+        return [os.path.join(home, ".zshrc")]
+    if shell == "bash":
+        login = [os.path.join(home, n) for n in (".bash_profile", ".bash_login", ".profile")
+                 if os.path.isfile(os.path.join(home, n))]
+        return (login or [os.path.join(home, ".profile")]) + [os.path.join(home, ".bashrc")]
+    return [os.path.join(home, ".profile")]
 
 def _autoupdate_line(fish):
     return (f"set -gx {AUTOUPDATE_ENV} true" if fish
@@ -846,26 +853,37 @@ def _autoupdate_read_rc(path):
         return []
 
 def _autoupdate_persist_posix(enable):
-    """Add or remove the marked variable lines in a shell startup file."""
-    paths, fish = _autoupdate_rc_candidates()
+    """Add or remove the marked variable lines in the shell startup files."""
+    fish = os.path.basename(os.environ.get("SHELL") or "") == "fish"
     managed = {AUTOUPDATE_MARK, _autoupdate_line(True), _autoupdate_line(False)}
     if enable:
-        path = next((p for p in paths if os.path.isfile(p)), paths[0])
-        lines = [l for l in _autoupdate_read_rc(path) if l not in managed]
-        lines += ["", AUTOUPDATE_MARK, _autoupdate_line(fish)]
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-            f.write("\n".join(lines) + "\n")
-        return path
-    for path in paths:
+        written = []
+        for path in _autoupdate_rc_files():
+            lines = [l for l in _autoupdate_read_rc(path) if l not in managed]
+            lines += ["", AUTOUPDATE_MARK, _autoupdate_line(fish)]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write("\n".join(lines) + "\n")
+            written.append(path)
+        return written
+    for path in _autoupdate_rc_files():
         if not os.path.isfile(path):
             continue
         lines = _autoupdate_read_rc(path)
         kept = [l for l in lines if l not in managed]
         if kept != lines:
             with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-                f.write("\n".join(kept) + "\n")
-    return None
+                f.write("".join(l + "\n" for l in kept))
+    return []
+
+def _win_broadcast_environment_change():
+    """Let already-running shells see the user environment change."""
+    try:
+        import ctypes
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0,
+                                                  ctypes.c_wchar_p("Environment"), 0x2, 5000, None)
+    except Exception:
+        pass
 
 def _autoupdate_persist_windows(enable):
     """Set or remove the variable in the user environment."""
@@ -878,13 +896,7 @@ def _autoupdate_persist_windows(enable):
                 winreg.DeleteValue(key, AUTOUPDATE_ENV)
             except FileNotFoundError:
                 pass
-    try:
-        # Let already-running shells see the change without a re-login.
-        import ctypes
-        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0,
-                                                  ctypes.c_wchar_p("Environment"), 0x2, 5000, None)
-    except Exception:
-        pass
+    _win_broadcast_environment_change()
 
 def _autoupdate_persistent_state():
     """Return (disabled persistently, where)."""
@@ -897,11 +909,10 @@ def _autoupdate_persistent_state():
                 return str(value).lower() == "true", where
         except OSError:
             return False, where
-    rc_paths, _ = _autoupdate_rc_candidates()
+    rc_paths = _autoupdate_rc_files()
+    active = {_autoupdate_line(True), _autoupdate_line(False)}
     for path in rc_paths:
-        if os.path.isfile(path) and any(l in {AUTOUPDATE_MARK, _autoupdate_line(True),
-                                              _autoupdate_line(False)}
-                                        for l in _autoupdate_read_rc(path)):
+        if os.path.isfile(path) and any(l in active for l in _autoupdate_read_rc(path)):
             return True, path
     return False, None
 
@@ -922,8 +933,11 @@ def run_autoupdate(argv):
             info("disable it with: python manager.py autoupdate off")
         return 0
     if action == "off":
-        where = (_autoupdate_persist_windows(True) if os.name == "nt"
-                 else _autoupdate_persist_posix(True)) or "the user environment (HKCU\\Environment)"
+        if os.name == "nt":
+            _autoupdate_persist_windows(True)
+            where = "the user environment (HKCU\\Environment)"
+        else:
+            where = ", ".join(_autoupdate_persist_posix(True))
         os.environ[AUTOUPDATE_ENV] = "true"
         ok("Antigravity CLI background auto-update disabled")
         info(f"persisted in {where}")

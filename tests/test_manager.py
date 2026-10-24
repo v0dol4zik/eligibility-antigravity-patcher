@@ -503,43 +503,96 @@ class UpdateReplacedTests(unittest.TestCase):
 
 
 class AutoupdateTests(unittest.TestCase):
-    def _posix(self, home, shell):
+    @staticmethod
+    def _posix(home, shell):
+        # Force the POSIX branch even on Windows so no test touches the real
+        # user environment or registry (mock.patch.dict restores added keys).
         return (mock.patch.object(manager.os.path, "expanduser", return_value=home),
-                mock.patch.dict(manager.os.environ, {"SHELL": shell, "HOME": home}))
+                mock.patch.object(manager.os, "name", "posix"),
+                mock.patch.dict(manager.os.environ,
+                                {"SHELL": shell, "HOME": home, manager.AUTOUPDATE_ENV: ""}))
 
     def test_posix_off_persists_marked_lines_and_on_removes_them(self):
-        for shell, rel in (("/bin/bash", ".bashrc"), ("/usr/bin/fish", ".config/fish/config.fish")):
+        for shell, rels in (("/bin/bash", (".profile", ".bashrc")),
+                            ("/usr/bin/fish", (".config/fish/config.fish",))):
             with (self.subTest(shell=shell), tempfile.TemporaryDirectory() as home,
-                  contextlib.redirect_stdout(io.StringIO())):
-                rc = os.path.join(home, rel)
+                  contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO())):
+                rc = os.path.join(home, rels[-1])
                 os.makedirs(os.path.dirname(rc), exist_ok=True)
                 _write(rc, b"# existing config\n")
-                with contextlib.ExitStack() as stack:
-                    for patcher in self._posix(home, shell):
-                        stack.enter_context(patcher)
-                    out = io.StringIO()
-                    with contextlib.redirect_stdout(out):
-                        self.assertEqual(manager.run_autoupdate(["off"]), 0)
-                    with open(rc, encoding="utf-8") as f:
+                for patcher in self._posix(home, shell):
+                    stack.enter_context(patcher)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run_autoupdate(["off"]), 0)
+                for rel in rels:
+                    with open(os.path.join(home, rel), encoding="utf-8") as f:
                         content = f.read()
-                    self.assertIn("# existing config", content)
                     self.assertIn(manager.AUTOUPDATE_MARK, content)
                     expected = (f"set -gx {manager.AUTOUPDATE_ENV} true" if shell.endswith("fish")
                                 else f"export {manager.AUTOUPDATE_ENV}=true")
                     self.assertIn(expected, content)
-                    out = io.StringIO()
-                    with contextlib.redirect_stdout(out):
-                        self.assertEqual(manager.run_autoupdate(["status"]), 0)
-                    self.assertIn("disabled", out.getvalue())
-                    self.assertIn(rc, out.getvalue())
-                    out = io.StringIO()
-                    with contextlib.redirect_stdout(out):
-                        self.assertEqual(manager.run_autoupdate(["on"]), 0)
-                    with open(rc, encoding="utf-8") as f:
+                self.assertIn("# existing config", open(rc, encoding="utf-8").read())
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run_autoupdate(["status"]), 0)
+                self.assertIn("disabled", out.getvalue())
+                self.assertIn("persistent: set in", out.getvalue())
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run_autoupdate(["on"]), 0)
+                for rel in rels:
+                    with open(os.path.join(home, rel), encoding="utf-8") as f:
                         content = f.read()
-                    self.assertIn("# existing config", content)
                     self.assertNotIn(manager.AUTOUPDATE_MARK, content)
                     self.assertNotIn(manager.AUTOUPDATE_ENV, content)
+                self.assertIn("# existing config", open(rc, encoding="utf-8").read())
+
+    def test_posix_bash_login_profile_without_rc_source_keeps_variable(self):
+        # A bash login shell reads .bash_profile even when it never sources
+        # .bashrc, so the variable must land in both files.
+        with (tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack,
+              contextlib.redirect_stdout(io.StringIO())):
+            bashrc = os.path.join(home, ".bashrc")
+            profile = os.path.join(home, ".bash_profile")
+            _write(bashrc, b"# aliases\n")
+            _write(profile, b"# login profile without .bashrc\n")
+            for patcher in self._posix(home, "/bin/bash"):
+                stack.enter_context(patcher)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(manager.run_autoupdate(["off"]), 0)
+            expected = f"export {manager.AUTOUPDATE_ENV}=true"
+            for path in (bashrc, profile):
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+                self.assertIn(expected, content)
+                self.assertIn(manager.AUTOUPDATE_MARK, content)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run_autoupdate(["status"]), 0)
+            self.assertIn("disabled", out.getvalue())
+            self.assertIn("persistent: set in", out.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(manager.run_autoupdate(["on"]), 0)
+            for path in (bashrc, profile):
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+                self.assertNotIn(manager.AUTOUPDATE_ENV, content)
+                self.assertNotIn(manager.AUTOUPDATE_MARK, content)
+
+    def test_status_marker_line_alone_is_not_a_persistent_setting(self):
+        # A lone marker comment without the actual line must not read as disabled.
+        with (tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack,
+              contextlib.redirect_stdout(io.StringIO())):
+            rc = os.path.join(home, ".bashrc")
+            _write(rc, (manager.AUTOUPDATE_MARK + "\n").encode())
+            for patcher in self._posix(home, "/bin/bash"):
+                stack.enter_context(patcher)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run_autoupdate(["status"]), 0)
+            self.assertIn("background auto-update: enabled", out.getvalue())
+            self.assertIn("persistent: not set", out.getvalue())
 
     def test_windows_registry_roundtrip(self):
         class FakeWinreg:
@@ -559,13 +612,16 @@ class AutoupdateTests(unittest.TestCase):
         with (tempfile.TemporaryDirectory(),
               mock.patch.dict("sys.modules", {"winreg": fake}),
               mock.patch.object(manager.os, "name", "nt"),
+              mock.patch.object(manager, "_win_broadcast_environment_change") as broadcast,
               contextlib.redirect_stdout(io.StringIO())):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(manager.run_autoupdate(["off"]), 0)
+                self.assertEqual(fake.store[manager.AUTOUPDATE_ENV], "true")
                 self.assertEqual(manager.run_autoupdate(["status"]), 0)
                 self.assertEqual(manager.run_autoupdate(["on"]), 0)
             self.assertEqual(fake.store.get(manager.AUTOUPDATE_ENV), None)
+            self.assertEqual(broadcast.call_count, 2)
             self.assertIn("disabled", out.getvalue())
             self.assertIn("re-enabled", out.getvalue())
 
